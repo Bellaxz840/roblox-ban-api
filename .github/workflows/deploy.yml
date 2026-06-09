@@ -1,0 +1,69 @@
+name: Deploy RoAdmin Bot
+
+on:
+  push:
+    branches:
+      - master
+    paths-ignore:
+      - "README.md"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to GCP VM via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY }}
+        with:
+          host: ${{ secrets.REMOTE_HOST }}
+          username: ${{ secrets.REMOTE_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          envs: DISCORD_TOKEN,ENCRYPTION_KEY
+          script: |
+            set -euo pipefail
+
+            APP_DIR="$HOME/RoAdmin"
+            APP_NAME="RoAdmin"
+
+            export PATH="/usr/local/bin:/usr/bin:/bin:$HOME/.npm-global/bin:$PATH"
+
+            # 0. Pull latest code (clean slate)
+            cd "$APP_DIR"
+            git config --global --add safe.directory "$APP_DIR"
+            git fetch --all
+            git reset --hard origin/master
+            git clean -fd
+
+            # 2. Write .env - secrets passed as env vars, never interpolated into the script text
+            printf 'DISCORD_TOKEN=%s\nENCRYPTION_KEY=%s\nNODE_ENV=production\n' \
+              "$DISCORD_TOKEN" "$ENCRYPTION_KEY" > .env
+            chmod 600 .env
+
+            # 3. Install production dependencies (incremental - only installs what changed)
+            npm install --omit=dev
+
+            # 4. Kill the PM2 daemon entirely and wipe stale state
+            # (prior sudo/root runs leave ~/.pm2/ root-owned; daemon can't write logs there)
+            pm2 kill 2>/dev/null || true
+            rm -rf "$HOME/.pm2" || true
+
+            # 5. Start the bot fresh via ecosystem config (spawns a new daemon)
+            pm2 start ecosystem.config.js
+
+            # 6. Persist PM2 process list so the bot survives VM reboots
+            pm2 save
+
+            # 7. Diagnostics: show actual log paths and verify content
+            sleep 5
+            echo "=== PM2 DESCRIBE ==="
+            pm2 describe "$APP_NAME" | grep -i 'log\|out_file\|error_file\|out log\|error log\|exec mode\|status\|restarts'
+            echo "=== LOG FILES ==="
+            ls -la "$HOME/.pm2/logs/" 2>/dev/null || echo "~/.pm2/logs/ does not exist"
+            echo "=== STDOUT LOG CONTENT (last 50 lines) ==="
+            tail -n 50 "$HOME/.pm2/logs/${APP_NAME}-out.log" 2>/dev/null || tail -n 50 "$HOME/.pm2/logs/${APP_NAME}-out-0.log" 2>/dev/null || echo "No out.log found"
+            echo "=== STDERR LOG CONTENT (last 50 lines) ==="
+            tail -n 50 "$HOME/.pm2/logs/${APP_NAME}-error.log" 2>/dev/null || tail -n 50 "$HOME/.pm2/logs/${APP_NAME}-error-0.log" 2>/dev/null || echo "No error.log found"
+            echo "=== PM2 SHOW ==="
+            pm2 show "$APP_NAME"
